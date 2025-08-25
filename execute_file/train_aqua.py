@@ -4,9 +4,9 @@ from ultralytics import YOLO
 if __name__ == '__main__':
   # model = YOLO('ultralytics/cfg/models/v8/yolov8n.yaml')
   # model.load('yolov8n.pt')  #注释则不加载
-  model = YOLO("yolov8x.pt")
+  model = YOLO("./yolov8x.pt")
   results = model.train(
-    data='/Users/luan_chengche/Desktop/yolo-npu/airplane_data.yaml',  #数据集配置文件的路径
+    data='./datasets/UAV_yaml/airplane_data.yaml',  #数据集配置文件的路径
     epochs=200,  #训练轮次总数
     batch=16,  #批量大小，即单次输入多少图片训练
     imgsz=640,  #训练图像尺寸

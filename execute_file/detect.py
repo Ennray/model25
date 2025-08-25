@@ -1,11 +1,11 @@
 from ultralytics import YOLO
 
 if __name__ == "__main__":
-    model = YOLO("runs/detect/train5/weights/best.pt")
+    model = YOLO("./runs/detect/train5/weights/best.pt")
     results = model.predict(
-        source="datasets/VisDrone/test/images",
+        source="./datasets/VisDrone/test/images",
         save=True,
-        data="datasets/UAV_yaml/VisDrone.yaml",
+        data="./datasets/UAV_yaml/VisDrone.yaml",
         batch=4
     )
 

@@ -47,11 +47,12 @@ class Target3D:
         return c_mean, np.array([w_max, h_max, d_max])
 
 # ---------- 主流程 ----------
-def main():
-    img_dir   = 'E:\work\model_lcc\yolo-npu/airplane_detect_images'            # 图片文件夹
-    out_file  = 'result_3d.txt'
+def main(config: dict | None = None) -> dict:
+    img_dir   = './datasets/airplane_detect_images'  # 图片文件夹
+    out_file  = './result_3d.txt'
     win_size  = 30                # 每 30 张算 1 个目标
-    model     = YOLO('runs/detect/train8/weights/best.pt')   # 权重路径
+    model     = YOLO('./runs/detect/train8/weights/best.pt')   # 权重路径
+    out_info = []
 
     # 读取所有图片并按文件名排序
     img_list = sorted(glob.glob(os.path.join(img_dir, '*.*')))
@@ -62,6 +63,7 @@ def main():
 
     with open(out_file, 'w', encoding='utf-8') as f:
         f.write('target_id,cx,cy,cz,w,h,d\n')
+
 
         for start in range(0, len(img_list), win_size):
             end   = start + win_size
@@ -90,9 +92,15 @@ def main():
                 line = f"{target_id},{c_final[0]:.3f},{c_final[1]:.3f},{c_final[2]:.3f}," \
                        f"{whd_final[0]:.3f},{whd_final[1]:.3f},{whd_final[2]:.3f}\n"
                 f.write(line)
+                #==============输出为（编号、以检测框中心点位圆点的x轴坐标、y轴坐标、z轴坐标、识别物的宽度、识别物的高度、识别物的深度）===================
+                out_info.append([target_id, c_final[0], c_final[1], c_final[2], whd_final[0], whd_final[1], whd_final[2]])
                 print(f"目标 {target_id}: 3D中心 {c_final} 尺寸 {whd_final}")
+    out = {
+        "size_result": out_info,
+    }
 
     print("全部完成，结果已写入", out_file)
+    return out
 
 if __name__ == '__main__':
-    main()
+    result = main()
