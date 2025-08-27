@@ -2,7 +2,7 @@ import json
 from flask import Flask, request, jsonify
 from werkzeug.exceptions import BadRequest
 import numpy as np
-from execute_file import offline_3d_detect as SizeRecognition
+import offline_3d_detect as SizeRecognition
 
 app = Flask(__name__)
 
