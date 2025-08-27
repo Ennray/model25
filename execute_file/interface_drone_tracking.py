@@ -11,7 +11,7 @@ app.json.sort_keys = False
 app.json.ensure_ascii = False
 
 # 固定的保存与运行路径
-DATA_DIR = Path(r"/datasets/UAV_tracking_video")
+DATA_DIR = Path(r"E:\work\model25789\datasets\UAV_tracking_video")
 FIXED_INPUT_NAME = "input_video.mp4"  # 所有上传视频都覆盖为这个名字
 
 def _guess_mime(path: str) -> str:
@@ -37,7 +37,7 @@ def upload_and_track():
         f.save(str(fixed_input_path))
 
         # 3) 触发 tracking（使用 tracking.py 中写死的路径）
-        output_path = tracking()  # 返回输出 mp4 的绝对路径
+        output_path = tracking.run_tracking()  # 返回输出 mp4 的绝对路径
         if not os.path.isfile(output_path):
             raise BadRequest(f"输出视频未生成：{output_path}")
 
