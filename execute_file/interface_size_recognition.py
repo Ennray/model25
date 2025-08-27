@@ -4,6 +4,11 @@ from werkzeug.exceptions import BadRequest
 import numpy as np
 import offline_3d_detect as SizeRecognition
 
+
+'''
+模型2.2.2.1单机视场内物体尺寸识别接口
+'''
+
 app = Flask(__name__)
 
 # # 关闭键排序 & 允许中文直出

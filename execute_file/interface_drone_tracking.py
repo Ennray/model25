@@ -3,7 +3,11 @@ import os
 import mimetypes
 from flask import Flask, jsonify, send_file
 from werkzeug.exceptions import BadRequest
-from tracking import run_tracking  # 只调用你写死路径的 tracking
+from tracking import run_tracking  # 只调用写死路径的 tracking
+
+'''
+模型5跟踪重捕模型接口
+'''
 
 app = Flask(__name__)
 app.json.sort_keys = False

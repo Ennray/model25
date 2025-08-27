@@ -3,6 +3,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+'''
+封装模型5跟踪重捕，模型路径、输入视频路径、本地输出视频路径默认如下（需修改）
+'''
+
 # === 统一维护默认参数（都写死在这里） ===
 DEFAULT_MODEL  = r"E:\work\model25789\runs\detect\train1\best.pt"
 DEFAULT_INPUT  = r"E:\work\model25789\datasets\UAV_tracking_video\input_video.mp4"

@@ -8,6 +8,11 @@ import os, glob, cv2, numpy as np
 from ultralytics import YOLO
 from collections import deque
 
+'''
+模型2.2.2.1单机视场内物体尺寸识别算法
+输出为（编号、以检测框中心点位圆点的x轴坐标、y轴坐标、z轴坐标、识别物的宽度、识别物的高度、识别物的深度）
+'''
+
 # ---------- 固定相机参数 ----------
 IMG_W   = 1920
 IMG_H   = 1080

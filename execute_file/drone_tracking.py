@@ -5,7 +5,9 @@ import argparse
 import os
 from collections import defaultdict
 import math
-
+'''
+模型5跟踪重捕模型具体算法
+'''
 
 class FeatureDatabase:
     """特征数据库类，管理正负样本特征"""
