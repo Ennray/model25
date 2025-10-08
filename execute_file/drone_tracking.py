@@ -69,6 +69,17 @@ class DroneTracker:
         self.state = "TRACKING"  # TRACKING, LOST, WAITING
         self.lost_frames = 0
         self.max_lost_frames = 30
+        self.min_hits = 1
+        self.hits = 0
+        self.time_since_update = 0
+
+        # 仅用于“显示”的平滑/放大框（不影响真实跟踪）
+        self.display_bbox = None
+        self.disp_inflate = 1.22   # 显示时放大比例
+        self.disp_pad = 4           # 显示时额外像素边距
+        self.disp_alpha = 0.5       # 显示框EMA平滑系数
+        self.hold_frames = 2        # 可视化保留帧，避免短暂丢帧闪烁
+        self.scale_ema = 1.0        # 可选：尺度EMA，缓解“呼吸感”
 
         # 特征数据库
         self.feature_db = FeatureDatabase()
@@ -78,8 +89,8 @@ class DroneTracker:
         self.prev_features = None
 
         # 匹配阈值
-        self.global_match_threshold = 0.3
-        self.local_match_threshold = 0.4
+        self.global_match_threshold = 0.25  # 原0.3
+        self.local_match_threshold = 0.3    # 原0.4
         self.combined_match_threshold = 0.35
 
         # 变换参数
@@ -142,6 +153,13 @@ class DroneTracker:
             # 存储用于光流跟踪的特征点
             self.prev_features = np.array([[kp.pt[0], kp.pt[1]] for kp in adjusted_kp],
                                           dtype=np.float32).reshape(-1, 1, 2)
+        else:
+            # 兜底：若SIFT未取到点，用KLT角点作为首帧光流种子
+            corners = cv2.goodFeaturesToTrack(target_roi, maxCorners=80, qualityLevel=0.01,
+                                              minDistance=5, blockSize=3)
+            if corners is not None:
+                adjusted = corners.reshape(-1, 1, 2) + np.array([x1, y1])
+                self.prev_features = adjusted.astype(np.float32)
 
         # 提取背景特征（负样本）
         background_roi = gray_frame[bg_y1:bg_y2, bg_x1:bg_x2]
@@ -171,23 +189,39 @@ class DroneTracker:
 
         if self.state == "TRACKING":
             success = self._track_features(gray, detection_bbox)
-            if not success:
+            if success:
+                self.hits += 1
+                self.time_since_update = 0
+            else:
                 self.state = "LOST"
                 self.lost_frames = 1
+                self.time_since_update += 1
                 print(f"跟踪器 {self.track_id} 跟踪丢失")
 
         elif self.state == "LOST":
             self.lost_frames += 1
+            self.time_since_update += 1
             if self.lost_frames > self.max_lost_frames:
                 self.state = "DEAD"
                 return False
 
-            # 尝试重新捕获
+            # 无检测框时的盲重捕
+            success = self._try_reacquire(gray)
+            if success:
+                self.state = "TRACKING"
+                self.lost_frames = 0
+                self.hits = 1  # 重获后从1开始累计
+                self.time_since_update = 0
+                print(f"跟踪器 {self.track_id} 重新捕获目标")
+
+            # 有检测框则尝试基于检测的重捕
             if detection_bbox is not None:
                 success = self._attempt_reacquisition(gray, detection_bbox)
                 if success:
                     self.state = "TRACKING"
                     self.lost_frames = 0
+                    self.hits = 1
+                    self.time_since_update = 0
                     print(f"跟踪器 {self.track_id} 重新捕获目标")
 
         self.prev_gray = gray.copy()
@@ -220,6 +254,10 @@ class DroneTracker:
         # 7. 判断跟踪状态
         if (global_match_rate < self.global_match_threshold and
                 local_match_rate < self.local_match_threshold):
+            return False
+
+        MIN_INLIERS = 12  # 可按目标大小在10~15范围微调
+        if len(valid_matches) < MIN_INLIERS:
             return False
 
         # 8. 更新目标位置
@@ -323,7 +361,7 @@ class DroneTracker:
 
             for kp in current_kp:
                 dist = np.linalg.norm(np.array(flow_pt) - np.array(kp.pt))
-                if dist < min_dist and dist < 20:  # 距离阈值
+                if dist < min_dist and dist < 30:  # 放宽到30像素，适配小目标抖动
                     min_dist = dist
                     best_match = kp
 
@@ -387,7 +425,9 @@ class DroneTracker:
             # 估算前一帧的平均距离
             prev_size = np.mean(self.size)
             scale_factor = avg_current_dist / (prev_size / 4) if prev_size > 0 else 1.0
-            scale_factor = np.clip(scale_factor, 0.5, 2.0)  # 限制尺度变化范围
+            # 尺度做EMA缓冲并限制范围，减少“呼吸感”
+            self.scale_ema = 0.8 * self.scale_ema + 0.2 * scale_factor
+            scale_factor = np.clip(self.scale_ema, 0.9, 1.25)
         else:
             scale_factor = 1.0
 
@@ -395,6 +435,22 @@ class DroneTracker:
         rotation_angle = 0.0  # 可以根据需要实现更复杂的旋转计算
 
         return scale_factor, rotation_angle
+
+    def _inflate_bbox(self, bbox, scale, pad, frame_shape):
+        """仅用于显示：放大并裁剪到画面内"""
+        H, W = frame_shape[:2]
+        x1, y1, x2, y2 = map(float, bbox)
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        w, h = (x2 - x1) * scale, (y2 - y1) * scale
+        nx1, ny1 = int(round(cx - w / 2 - pad)), int(round(cy - h / 2 - pad))
+        nx2, ny2 = int(round(cx + w / 2 + pad)), int(round(cy + h / 2 + pad))
+        nx1 = max(0, min(nx1, W - 1)); ny1 = max(0, min(ny1, H - 1))
+        nx2 = max(0, min(nx2, W - 1)); ny2 = max(0, min(ny2, H - 1))
+        return (nx1, ny1, nx2, ny2)
+
+    def _smooth_bbox(self, prev_bbox, cur_bbox, alpha):
+        """仅用于显示：对框做EMA平滑"""
+        return tuple(int(round((1 - alpha) * p + alpha * c)) for p, c in zip(prev_bbox, cur_bbox))
 
     def _update_target_position(self, valid_matches):
         """根据有效匹配点更新目标位置"""
@@ -424,9 +480,23 @@ class DroneTracker:
             self.center[1] + new_height // 2
         )
 
+        H, W = self.prev_gray.shape
+        x1 = max(0, min(self.bbox[0], W - 1))
+        y1 = max(0, min(self.bbox[1], H - 1))
+        x2 = max(0, min(self.bbox[2], W - 1))
+        y2 = max(0, min(self.bbox[3], H - 1))
+        self.bbox = (x1, y1, x2, y2)
+
         # 存储变换参数
         self.scale_factor = scale_factor
         self.rotation_angle = rotation_angle
+
+        # —— 仅用于显示：放大+平滑显示框（不影响真实bbox） ——
+        inflated = self._inflate_bbox(self.bbox, self.disp_inflate, self.disp_pad, self.prev_gray.shape)
+        if self.display_bbox is None:
+            self.display_bbox = inflated
+        else:
+            self.display_bbox = self._smooth_bbox(self.display_bbox, inflated, self.disp_alpha)
 
     def _update_feature_database(self, current_gray, current_features):
         """更新特征数据库"""
@@ -466,6 +536,14 @@ class DroneTracker:
         else:
             self.prev_features = None
 
+    def _try_reacquire(self, current_gray):
+        """
+        在没有 detection_bbox 的情况下做一次“盲重捕”：
+        直接复用光流+特征匹配的跟踪逻辑尝试找回目标。
+        成功返回 True，失败返回 False。
+        """
+        return self._track_features(current_gray, detection_bbox=None)
+
     def _attempt_reacquisition(self, current_gray, detection_bbox):
         """尝试重新捕获目标"""
         # 计算检测框与上次位置的距离
@@ -479,12 +557,16 @@ class DroneTracker:
             self.center = det_center
             self.size = self._get_size(detection_bbox)
             self._extract_initial_features(current_gray)
+            # 同步显示框（避免重捕后一两帧框跳变）
+            H, W = current_gray.shape[:2]
+            inflated = self._inflate_bbox(self.bbox, self.disp_inflate, self.disp_pad, (H, W))
+            self.display_bbox = inflated
             return True
 
         return False
 
     def get_state_color(self):
-        """获取跟踪状态对应的颜色"""
+        """获取跟踪状态对应的颜色（保留，但绘制时统一用绿）"""
         if self.state == "TRACKING":
             return (0, 255, 0)  # 绿色
         elif self.state == "LOST":
@@ -497,10 +579,27 @@ class DroneTrackingSystem:
     """无人机跟踪系统主类"""
 
     def __init__(self, model_path):
+        """最后三条约束适当更改"""
         self.model = YOLO(model_path)
         self.trackers = {}
         self.next_track_id = 1
         self.max_track_distance = 100
+        self.uav_class_ids = {0}  # 无人机类别ID；不是0就改
+        self.min_area = 20 * 20   # 太小的框直接丢
+        self.max_area_ratio = 0.25  # 超过画面25%的巨框丢弃
+        self.ar_range = (0.4, 2.5)  # 长宽比限制
+
+        # —— 可视化控制 ——
+        self.show_dets = False          # 不显示检测框（避免黄↔绿频闪）
+        self.show_features = False
+        self.track_color = (0, 255, 0)  # 统一绿色展示确认后的轨迹
+
+        # —— 统计信息显示控制 ——
+        self.show_stats = True  # 想干净就设 False
+        self.stats_every_n = 15  # 每 15 帧更新一次（30fps ≈ 0.5s 刷新）
+        self._cached_stats = ["", "", ""]
+        self._last_stats_update = -1
+        self._frame_index = 0
 
     def process_video(self, input_path, output_path, conf_threshold=0.5):
         """处理视频文件"""
@@ -525,26 +624,39 @@ class DroneTrackingSystem:
         try:
             while True:
                 ret, frame = cap.read()
+                self._frame_index += 1
                 if not ret:
                     break
 
                 frame_count += 1
                 print(f"处理帧: {frame_count}/{total_frames}", end='\r')
 
-                # YOLO检测
-                detections = self.model(frame, conf=conf_threshold, verbose=False)[0]
+                # YOLO检测（加上类与更紧的iou）
+                detections = self.model(frame, conf=conf_threshold, iou=0.45,
+                                        classes=list(self.uav_class_ids), verbose=False)[0]
 
-                # 获取检测框
                 detection_boxes = []
                 if detections.boxes is not None:
-                    boxes = detections.boxes.xyxy.cpu().numpy()
+                    boxes = detections.boxes.xyxy.cpu().numpy().astype(int)
                     confidences = detections.boxes.conf.cpu().numpy()
+                    classes = detections.boxes.cls.cpu().numpy().astype(int)
 
-                    for i, (box, conf) in enumerate(zip(boxes, confidences)):
-                        detection_boxes.append({
-                            'bbox': box.astype(int),
-                            'confidence': conf
-                        })
+                    H, W = frame.shape[:2]
+                    max_area = self.max_area_ratio * W * H
+
+                    for box, conf, cls in zip(boxes, confidences, classes):
+                        if cls not in self.uav_class_ids:
+                            continue
+                        x1, y1, x2, y2 = box
+                        w, h = x2 - x1, y2 - y1
+                        area = w * h
+                        if area < self.min_area or area > max_area:
+                            continue
+                        ar = w / max(h, 1)
+                        if not (self.ar_range[0] <= ar <= self.ar_range[1]):
+                            continue
+
+                        detection_boxes.append({'bbox': box, 'confidence': float(conf), 'cls': int(cls)})
 
                 # 更新跟踪器
                 self._update_trackers(frame, detection_boxes)
@@ -583,44 +695,59 @@ class DroneTrackingSystem:
         for detection in unassigned_detections:
             self._create_new_tracker(detection['bbox'], frame)
 
+    def _iou(self, a, b):
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        ua = (ax2 - ax1) * (ay2 - ay1)
+        ub = (bx2 - bx1) * (by2 - by1)
+        return inter / (ua + ub - inter + 1e-6)
+
     def _assign_detection_to_tracker(self, tracker, detections):
-        """为跟踪器分配最近的检测框"""
         if not detections:
             return None
 
-        min_distance = float('inf')
         best_detection = None
+        best_score = -1.0
 
-        tracker_center = tracker.center
+        for det in detections:
+            det_bbox = det['bbox']
+            iou = self._iou(tracker.bbox, det_bbox)
+            if iou >= 0.1:
+                score = 1.0 + iou  # 优先IoU
+            else:
+                det_center = self._get_bbox_center(det_bbox)
+                dist = np.linalg.norm(np.array(tracker.center) - np.array(det_center))
+                if dist > self.max_track_distance:
+                    continue
+                score = 1.0 / (1.0 + dist)  # 次选距离
 
-        for detection in detections:
-            det_center = self._get_bbox_center(detection['bbox'])
-            distance = np.linalg.norm(np.array(tracker_center) - np.array(det_center))
-
-            if distance < min_distance and distance < self.max_track_distance:
-                min_distance = distance
-                best_detection = detection['bbox']
+            if score > best_score:
+                best_score = score
+                best_detection = det_bbox
 
         return best_detection
 
     def _get_unassigned_detections(self, detections):
         """获取未分配的检测框"""
         unassigned = []
-
-        for detection in detections:
-            det_center = self._get_bbox_center(detection['bbox'])
-            is_assigned = False
-
-            for tracker in self.trackers.values():
-                if tracker.state == "TRACKING":
-                    distance = np.linalg.norm(np.array(tracker.center) - np.array(det_center))
-                    if distance < self.max_track_distance:
-                        is_assigned = True
+        for det in detections:
+            assigned = False
+            for trk in self.trackers.values():
+                if trk.state in ("TRACKING","LOST"):
+                    if self._iou(trk.bbox, det['bbox']) > 0.1:
+                        assigned = True
                         break
-
-            if not is_assigned:
-                unassigned.append(detection)
-
+                    cdist = np.linalg.norm(np.array(trk.center) -
+                                           np.array(self._get_bbox_center(det['bbox'])))
+                    if cdist < self.max_track_distance:
+                        assigned = True
+                        break
+            if not assigned:
+                unassigned.append(det)
         return unassigned
 
     def _create_new_tracker(self, bbox, frame):
@@ -637,19 +764,20 @@ class DroneTrackingSystem:
 
     def _draw_tracking_results(self, frame, detections):
         """绘制跟踪结果"""
-        # 绘制检测框
-        for detection in detections:
-            bbox = detection['bbox']
-            conf = detection['confidence']
-            x1, y1, x2, y2 = bbox
+        # （可选）绘制检测框：默认关闭，避免黄↔绿频闪
+        if self.show_dets:
+            for detection in detections:
+                bbox = detection['bbox']
+                conf = detection['confidence']
+                x1, y1, x2, y2 = bbox
 
-            # 绘制检测框（虚线）
-            self._draw_dashed_rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
+                # 绘制检测框（虚线）
+                self._draw_dashed_rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
 
-            # 检测标签
-            det_label = f"Det: {conf:.2f}"
-            cv2.putText(frame, det_label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # 检测标签
+                det_label = f"Det: {conf:.2f}"
+                cv2.putText(frame, det_label, (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         # 绘制跟踪框
         for tracker in self.trackers.values():
@@ -661,43 +789,47 @@ class DroneTrackingSystem:
         return frame
 
     def _draw_tracker(self, frame, tracker):
-        """绘制单个跟踪器"""
-        x1, y1, x2, y2 = tracker.bbox
-        color = tracker.get_state_color()
+        """绘制单个跟踪器：仅显示稳定的绿色框"""
+        # 只显示“已确认”的轨迹，并容忍短暂未更新，避免闪烁
+        if tracker.hits < tracker.min_hits:
+            return
+        if tracker.time_since_update > tracker.hold_frames:
+            return
+
+        # 优先使用显示框（放大+平滑），没有则回退真实bbox
+        box = tracker.display_bbox if tracker.display_bbox is not None else tracker.bbox
+        x1, y1, x2, y2 = map(int, box)
+        color = (0, 255, 0)  # 统一绿色
 
         # 绘制跟踪框
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
 
-        # 绘制中心点
-        cv2.circle(frame, tracker.center, 5, color, -1)
+        # 绘制中心点（用显示框中心）
+        cx, cy = (x1 + x2)//2, (y1 + y2)//2
+        cv2.circle(frame, (cx, cy), 5, color, -1)
 
-        # 绘制跟踪ID和状态
-        label = f"ID:{tracker.track_id} {tracker.state}"
-        if tracker.state == "LOST":
-            label += f" ({tracker.lost_frames})"
-
-        # 标签背景
+        # 绘制跟踪ID（统一用同一颜色）
+        label = f"ID:{tracker.track_id}"
         (text_width, text_height), baseline = cv2.getTextSize(
             label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(frame, (x1, y1 - text_height - 10),
                       (x1 + text_width, y1), color, -1)
-
-        # 标签文字
         cv2.putText(frame, label, (x1, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        # 绘制特征点（仅在跟踪状态下）
-        if tracker.state == "TRACKING" and tracker.feature_db.positive_features:
-            for kp in tracker.feature_db.positive_features[-20:]:  # 显示最近的20个特征点
+        # （可选）显示少量特征点
+        # （可选）显示少量特征点
+        if getattr(tracker, "show_features",
+                   False) and tracker.state == "TRACKING" and tracker.feature_db.positive_features:
+            for kp in tracker.feature_db.positive_features[-20:]:
                 pt = (int(kp.pt[0]), int(kp.pt[1]))
-                cv2.circle(frame, pt, 2, (0, 255, 255), -1)  # 黄色特征点
+                cv2.circle(frame, pt, 2, self.track_color, -1)  # 若想保留，改成绿色
 
     def _draw_dashed_rectangle(self, frame, pt1, pt2, color, thickness):
         """绘制虚线矩形"""
         x1, y1 = pt1
         x2, y2 = pt2
 
-        # 计算虚线长度
         dash_length = 10
 
         # 顶边
@@ -717,20 +849,24 @@ class DroneTrackingSystem:
             cv2.line(frame, (x2, y), (x2, min(y + dash_length, y2)), color, thickness)
 
     def _draw_statistics(self, frame):
-        """绘制统计信息"""
-        # 统计各状态的跟踪器数量
-        tracking_count = sum(1 for t in self.trackers.values() if t.state == "TRACKING")
-        lost_count = sum(1 for t in self.trackers.values() if t.state == "LOST")
-        total_count = len(self.trackers)
+        if not self.show_stats:
+            return
 
-        # 绘制统计信息背景
-        stats_text = [
-            f"Total Drones: {total_count}",
-            f"Tracking: {tracking_count}",
-            f"Lost: {lost_count}"
-        ]
+        # 仅每 N 帧刷新一次数值，其余帧复用上次的文本，避免“跳数”感
+        if (self._frame_index - self._last_stats_update) >= self.stats_every_n:
+            tracking_count = sum(1 for t in self.trackers.values() if t.state == "TRACKING")
+            lost_count = sum(1 for t in self.trackers.values() if t.state == "LOST")
+            total_count = len(self.trackers)
+            self._cached_stats = [
+                f"Total Drones: {total_count}",
+                f"Tracking: {tracking_count}",
+                f"Lost: {lost_count}"
+            ]
+            self._last_stats_update = self._frame_index
 
-        # 计算背景尺寸
+        stats_text = self._cached_stats
+
+        # 下面保持你原来的绘制逻辑
         max_width = 0
         total_height = 0
         for text in stats_text:
@@ -738,13 +874,9 @@ class DroneTrackingSystem:
             max_width = max(max_width, w)
             total_height += h + 5
 
-        # 绘制背景
-        cv2.rectangle(frame, (10, 10), (max_width + 20, total_height + 20),
-                      (0, 0, 0), -1)
-        cv2.rectangle(frame, (10, 10), (max_width + 20, total_height + 20),
-                      (255, 255, 255), 2)
+        cv2.rectangle(frame, (10, 10), (max_width + 20, total_height + 20), (0, 0, 0), -1)
+        cv2.rectangle(frame, (10, 10), (max_width + 20, total_height + 20), (255, 255, 255), 2)
 
-        # 绘制文字
         y_offset = 35
         for text in stats_text:
             cv2.putText(frame, text, (15, y_offset),
@@ -761,24 +893,21 @@ def main():
                         help='输入视频文件路径 (.mp4)')
     parser.add_argument('--output', '-o', type=str, required=True,
                         help='输出视频文件路径 (.mp4)')
-    parser.add_argument('--conf', '-c', type=float, default=0.5,
-                        help='置信度阈值 (默认: 0.5)')
+    parser.add_argument('--conf', '-c', type=float, default=0.8,
+                        help='置信度阈值 (默认: 0.8)')
 
     args = parser.parse_args()
 
-    # 检查文件是否存在
     if not os.path.exists(args.model):
         raise FileNotFoundError(f"模型文件不存在: {args.model}")
 
     if not os.path.exists(args.input):
         raise FileNotFoundError(f"输入视频文件不存在: {args.input}")
 
-    # 确保输出目录存在
     output_dir = os.path.dirname(args.output)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # 创建跟踪系统并处理视频
     tracking_system = DroneTrackingSystem(args.model)
     tracking_system.process_video(args.input, args.output, args.conf)
 
@@ -797,16 +926,12 @@ def example_usage():
         print(f"请确保输入视频文件存在: {input_video}")
         return
 
-    # 创建跟踪系统
     tracking_system = DroneTrackingSystem(model_path)
     tracking_system.process_video(input_video, output_video, conf_threshold=0.5)
 
 
 if __name__ == "__main__":
-    # 如果您想直接运行示例，请取消注释下面这行
     # example_usage()
-
-    # 使用命令行参数运行
     main()
 
 """
@@ -827,31 +952,14 @@ if __name__ == "__main__":
 - 跟踪状态自动管理
 
 跟踪状态:
-- TRACKING (绿色): 正常跟踪状态
-- LOST (橙色): 跟踪丢失，正在尝试重捕获
-- DEAD (红色): 跟踪器已失效
+- TRACKING: 正常跟踪状态
+- LOST: 跟踪丢失，正在尝试重捕获
+- DEAD: 跟踪器已失效
 
-视觉元素:
-- 实线框: 跟踪框，颜色表示状态
-- 虚线框: YOLO检测框
-- 黄色小点: 目标特征点
-- 绿色圆点: 跟踪中心
-- 统计面板: 显示跟踪状态统计
+可视化策略:
+- 只显示“已确认”的绿色跟踪框，检测框默认不显示
+- 显示框做放大+EMA平滑+1–2帧保留，避免频闪，视觉更稳
 
-使用方法:
-1. 命令行:
-   python drone_tracking.py --model best.pt --input input_video.mp4 --output output_result_tracking.mp4
-
-2. 代码调用:
-   修改example_usage()中的路径并运行
-
-所需依赖:
+依赖:
 pip install ultralytics opencv-python numpy
-
-算法特点:
-- 自适应特征更新
-- 多尺度不变性特征提取
-- 鲁棒的跟踪丢失检测
-- 智能重捕获机制
-- 实时性能优化
 """
