@@ -73,6 +73,11 @@ class DroneTracker:
         self.hits = 0
         self.time_since_update = 0
 
+        # —— 尺度/尺寸保护阈值（放这里，避免找不到属性） ——
+        self.scale_step_clip = (0.88, 1.12)  # 单帧尺度允许 [−12%, +12%]
+        self.max_box_area_ratio = 0.12  # 框最大面积占画面比例
+        self.min_box_side = 8  # 最小边（像素）
+
         # 仅用于“显示”的平滑/放大框（不影响真实跟踪）
         self.display_bbox = None
         self.disp_inflate = 1.22   # 显示时放大比例
@@ -427,7 +432,7 @@ class DroneTracker:
             scale_factor = avg_current_dist / (prev_size / 4) if prev_size > 0 else 1.0
             # 尺度做EMA缓冲并限制范围，减少“呼吸感”
             self.scale_ema = 0.8 * self.scale_ema + 0.2 * scale_factor
-            scale_factor = np.clip(self.scale_ema, 0.9, 1.25)
+            scale_factor = float(np.clip(self.scale_ema, *self.scale_step_clip))
         else:
             scale_factor = 1.0
 
@@ -464,11 +469,26 @@ class DroneTracker:
         # 计算变换因子
         scale_factor, rotation_angle = self._calculate_transformation(valid_matches)
 
-        # 更新尺寸
-        new_width = int(self.size[0] * scale_factor)
-        new_height = int(self.size[1] * scale_factor)
+        # 更新尺寸（先按尺度放大/缩小，给个最小边兜底）
+        new_width = int(max(self.min_box_side, self.size[0] * scale_factor))
+        new_height = int(max(self.min_box_side, self.size[1] * scale_factor))
 
-        # 更新边界框
+        # —— 防爆炸：限制候选新框的绝对尺寸（面积/边长上限） ——
+        H, W = self.prev_gray.shape
+
+        # 1) 面积上限：不超过画面一定比例（max_box_area_ratio）
+        max_area = self.max_box_area_ratio * H * W
+        new_area = new_width * new_height
+        if new_area > max_area:
+            scale = (max_area / (new_area + 1e-6)) ** 0.5  # 按面积等比缩回
+            new_width = max(self.min_box_side, int(new_width * scale))
+            new_height = max(self.min_box_side, int(new_height * scale))
+
+        # 2) 单边上限：任何一边不超过画面 1/3（可按需 0.30~0.40 调）
+        new_width = int(np.clip(new_width, self.min_box_side, int(W * 0.33)))
+        new_height = int(np.clip(new_height, self.min_box_side, int(H * 0.33)))
+
+        # 更新中心与尺寸
         self.center = (int(new_center[0]), int(new_center[1]))
         self.size = (new_width, new_height)
 
@@ -480,7 +500,7 @@ class DroneTracker:
             self.center[1] + new_height // 2
         )
 
-        H, W = self.prev_gray.shape
+        # 裁剪到画面内
         x1 = max(0, min(self.bbox[0], W - 1))
         y1 = max(0, min(self.bbox[1], H - 1))
         x2 = max(0, min(self.bbox[2], W - 1))
@@ -585,9 +605,13 @@ class DroneTrackingSystem:
         self.next_track_id = 1
         self.max_track_distance = 100
         self.uav_class_ids = {0}  # 无人机类别ID；不是0就改
-        self.min_area = 20 * 20   # 太小的框直接丢
+        self.min_area = 10 * 10   # 太小的框直接丢
         self.max_area_ratio = 0.25  # 超过画面25%的巨框丢弃
         self.ar_range = (0.4, 2.5)  # 长宽比限制
+
+        self.scale_step_clip = (0.88, 1.12)  # 单帧尺度允许 [−12%, +12%]
+        self.max_box_area_ratio = 0.12  # 显示框最多占画面 12% 面积
+        self.min_box_side = 8  # 最小边，避免被夹到 0
 
         # —— 可视化控制 ——
         self.show_dets = False          # 不显示检测框（避免黄↔绿频闪）
@@ -596,10 +620,57 @@ class DroneTrackingSystem:
 
         # —— 统计信息显示控制 ——
         self.show_stats = True  # 想干净就设 False
+        self.stats_period_sec = 0.25  # 每0.25s刷新一次信息
         self.stats_every_n = 15  # 每 15 帧更新一次（30fps ≈ 0.5s 刷新）
         self._cached_stats = ["", "", ""]
         self._last_stats_update = -1
         self._frame_index = 0
+
+        # —— ID 复用池（短期记忆） ——
+        self.recent_dead = []  # 列表元素: dict(id, bbox, center, frame_idx)
+        self.reuse_ttl = 90  # 允许在最近 90 帧内复活同一ID（按需要调）
+
+    def _remember_dead_tracker(self, tracker):
+        self.recent_dead.append({
+            "id": tracker.track_id,
+            "bbox": tracker.bbox,
+            "center": tracker.center,
+            "frame_idx": self._frame_index
+        })
+        # 清理过期
+        self.recent_dead = [d for d in self.recent_dead if self._frame_index - d["frame_idx"] <= self.reuse_ttl]
+
+    def _reuse_dead_id_if_possible(self, bbox, frame):
+        """
+        若有近邻的 DEAD 轨迹，则复用其 ID；返回 True 表示已用旧号复活。
+        复用条件：IoU >= 0.15  或  中心距 < 0.06 * 图像对角线
+        """
+        if not self.recent_dead:
+            return False
+
+        H, W = frame.shape[:2]
+        diag = float(np.hypot(W, H))  # 图像对角线长度
+        det_center = self._get_bbox_center(bbox)
+
+        best, best_score = None, -1.0
+        for d in self.recent_dead:
+            iou = self._iou(d["bbox"], bbox)
+            dist = np.linalg.norm(np.array(d["center"]) - np.array(det_center))
+            score = iou - 0.001 * dist  # 先看 IoU，再轻微惩罚距离
+            # 放宽复用门限：IoU 或 距离满足其一即可
+            if score > best_score and (iou >= 0.15 or dist <= 0.06 * diag):
+                best, best_score = d, score
+
+        if best is None:
+            return False
+
+        reused_id = best["id"]
+        tracker = DroneTracker(reused_id, bbox, frame)
+        self.trackers[reused_id] = tracker
+        # 从复用池移除该ID
+        self.recent_dead = [d for d in self.recent_dead if d["id"] != reused_id]
+        print(f"复用旧ID创建跟踪器: ID {reused_id}")
+        return True
 
     def process_video(self, input_path, output_path, conf_threshold=0.5):
         """处理视频文件"""
@@ -612,6 +683,15 @@ class DroneTrackingSystem:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # 自适应统计刷新步长
+        self.stats_every_n = max(1, int(fps * self.stats_period_sec))
+        # 自适应服用时间
+        self.reuse_ttl = max(60, int(fps * 4)) # 约3秒内优先复用旧ID
+
+        diag = (width ** 2 + height ** 2) ** 0.5
+        self.max_track_distance = max(self.max_track_distance, int(0.10 * diag))  # 允许更大位移
+
 
         print(f"视频信息: {width}x{height}, FPS: {fps}, 总帧数: {total_frames}")
 
@@ -643,6 +723,7 @@ class DroneTrackingSystem:
 
                     H, W = frame.shape[:2]
                     max_area = self.max_area_ratio * W * H
+                    min_area_px = max(self.min_area, int(0.00006 * W * H))
 
                     for box, conf, cls in zip(boxes, confidences, classes):
                         if cls not in self.uav_class_ids:
@@ -650,7 +731,7 @@ class DroneTrackingSystem:
                         x1, y1, x2, y2 = box
                         w, h = x2 - x1, y2 - y1
                         area = w * h
-                        if area < self.min_area or area > max_area:
+                        if area < min_area_px or area > max_area:
                             continue
                         ar = w / max(h, 1)
                         if not (self.ar_range[0] <= ar <= self.ar_range[1]):
@@ -677,23 +758,31 @@ class DroneTrackingSystem:
         print(f"\n处理完成! 输出视频已保存至: {output_path}")
 
     def _update_trackers(self, frame, detections):
-        """更新所有跟踪器"""
-        # 更新现有跟踪器
         active_trackers = {}
-        for track_id, tracker in self.trackers.items():
-            # 为跟踪器分配最近的检测框
-            assigned_detection = self._assign_detection_to_tracker(tracker, detections)
+        used_det_idx = set()  # 记录已被某轨迹占用的检测索引
 
-            # 更新跟踪器
-            if tracker.update(frame, assigned_detection):
+        # 先更新现有轨迹
+        for track_id, tracker in self.trackers.items():
+            det_idx, det_bbox = self._assign_detection_to_tracker(tracker, detections, used_det_idx)
+            if tracker.update(frame, det_bbox):
                 active_trackers[track_id] = tracker
+                if det_idx is not None:
+                    used_det_idx.add(det_idx)
+            else:
+                # 如果 DEAD，记录到“可复用ID池”
+                if tracker.state == "DEAD":
+                    self._remember_dead_tracker(tracker)
 
         self.trackers = active_trackers
 
-        # 为未分配的检测创建新跟踪器
-        unassigned_detections = self._get_unassigned_detections(detections)
-        for detection in unassigned_detections:
-            self._create_new_tracker(detection['bbox'], frame)
+        # 2) 对“未被任何轨迹使用”的检测，优先复用旧ID，否则新建
+        unassigned = self._get_unassigned_detections(detections, used_det_idx)
+        for idx, det in unassigned:
+            if self._reuse_dead_id_if_possible(det['bbox'], frame):
+                used_det_idx.add(idx)  # ← 复用后也标记为已使用
+            else:
+                self._create_new_tracker(det['bbox'], frame)
+                used_det_idx.add(idx)  # ← 新建后标记为已使用
 
     def _iou(self, a, b):
         ax1, ay1, ax2, ay2 = a
@@ -706,49 +795,54 @@ class DroneTrackingSystem:
         ub = (bx2 - bx1) * (by2 - by1)
         return inter / (ua + ub - inter + 1e-6)
 
-    def _assign_detection_to_tracker(self, tracker, detections):
+    def _assign_detection_to_tracker(self, tracker, detections, used_det_idx):
         if not detections:
-            return None
+            return None, None
 
-        best_detection = None
-        best_score = -1.0
+        best_idx, best_bbox, best_score = None, None, -1.0
 
-        for det in detections:
+        for idx, det in enumerate(detections):
+            if idx in used_det_idx:
+                continue
             det_bbox = det['bbox']
             iou = self._iou(tracker.bbox, det_bbox)
             if iou >= 0.1:
-                score = 1.0 + iou  # 优先IoU
+                score = 1.0 + iou
             else:
                 det_center = self._get_bbox_center(det_bbox)
                 dist = np.linalg.norm(np.array(tracker.center) - np.array(det_center))
                 if dist > self.max_track_distance:
                     continue
-                score = 1.0 / (1.0 + dist)  # 次选距离
+                score = 1.0 / (1.0 + dist)
 
             if score > best_score:
                 best_score = score
-                best_detection = det_bbox
+                best_idx = idx
+                best_bbox = det_bbox
 
-        return best_detection
+        return best_idx, best_bbox
 
-    def _get_unassigned_detections(self, detections):
-        """获取未分配的检测框"""
-        unassigned = []
-        for det in detections:
-            assigned = False
-            for trk in self.trackers.values():
-                if trk.state in ("TRACKING","LOST"):
-                    if self._iou(trk.bbox, det['bbox']) > 0.1:
-                        assigned = True
-                        break
-                    cdist = np.linalg.norm(np.array(trk.center) -
-                                           np.array(self._get_bbox_center(det['bbox'])))
-                    if cdist < self.max_track_distance:
-                        assigned = True
-                        break
-            if not assigned:
-                unassigned.append(det)
-        return unassigned
+    def _get_unassigned_detections(self, detections, used_det_idx):
+        return [(idx, det) for idx, det in enumerate(detections) if idx not in used_det_idx]
+
+    # def _get_unassigned_detections(self, detections):
+    #     """获取未分配的检测框"""
+    #     unassigned = []
+    #     for det in detections:
+    #         assigned = False
+    #         for trk in self.trackers.values():
+    #             if trk.state in ("TRACKING","LOST"):
+    #                 if self._iou(trk.bbox, det['bbox']) > 0.1:
+    #                     assigned = True
+    #                     break
+    #                 cdist = np.linalg.norm(np.array(trk.center) -
+    #                                        np.array(self._get_bbox_center(det['bbox'])))
+    #                 if cdist < self.max_track_distance:
+    #                     assigned = True
+    #                     break
+    #         if not assigned:
+    #             unassigned.append(det)
+    #     return unassigned
 
     def _create_new_tracker(self, bbox, frame):
         """创建新的跟踪器"""
@@ -801,6 +895,14 @@ class DroneTrackingSystem:
         x1, y1, x2, y2 = map(int, box)
         color = (0, 255, 0)  # 统一绿色
 
+        H, W = frame.shape[:2]
+        w, h = x2 - x1, y2 - y1
+        if w <= 0 or h <= 0:
+            return
+        # 任何一边超过画面 1/3，判为异常，不画（也不会闪大框）
+        if w > 0.33 * W or h > 0.33 * H:
+            return
+
         # 绘制跟踪框
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
 
@@ -817,13 +919,11 @@ class DroneTrackingSystem:
         cv2.putText(frame, label, (x1, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        # （可选）显示少量特征点
-        # （可选）显示少量特征点
-        if getattr(tracker, "show_features",
-                   False) and tracker.state == "TRACKING" and tracker.feature_db.positive_features:
+        # （可选）显示少量特征点（系统级开关）
+        if self.show_features and tracker.state == "TRACKING" and tracker.feature_db.positive_features:
             for kp in tracker.feature_db.positive_features[-20:]:
                 pt = (int(kp.pt[0]), int(kp.pt[1]))
-                cv2.circle(frame, pt, 2, self.track_color, -1)  # 若想保留，改成绿色
+                cv2.circle(frame, pt, 2, self.track_color, -1)
 
     def _draw_dashed_rectangle(self, frame, pt1, pt2, color, thickness):
         """绘制虚线矩形"""
@@ -852,21 +952,28 @@ class DroneTrackingSystem:
         if not self.show_stats:
             return
 
-        # 仅每 N 帧刷新一次数值，其余帧复用上次的文本，避免“跳数”感
+        # 仅每 N 帧更新一次数据
         if (self._frame_index - self._last_stats_update) >= self.stats_every_n:
+            # “可见”轨迹：与 _draw_tracker 的判定一致
+            visible_count = sum(
+                1 for t in self.trackers.values()
+                if t.hits >= t.min_hits and t.time_since_update <= t.hold_frames
+            )
             tracking_count = sum(1 for t in self.trackers.values() if t.state == "TRACKING")
             lost_count = sum(1 for t in self.trackers.values() if t.state == "LOST")
             total_count = len(self.trackers)
+
+            # 与视觉一致的三行
             self._cached_stats = [
                 f"Total Drones: {total_count}",
-                f"Tracking: {tracking_count}",
+                f"Visible: {visible_count}",  # 新增，可见数量 = 屏上应该看到的框
                 f"Lost: {lost_count}"
             ]
             self._last_stats_update = self._frame_index
 
         stats_text = self._cached_stats
 
-        # 下面保持你原来的绘制逻辑
+        # 以下保留你原来的绘制框背景的逻辑
         max_width = 0
         total_height = 0
         for text in stats_text:

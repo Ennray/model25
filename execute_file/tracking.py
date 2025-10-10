@@ -9,9 +9,9 @@ from pathlib import Path
 
 # === 统一维护默认参数（都写死在这里） ===
 DEFAULT_MODEL  = r"E:\work\model25789\runs\detect\train2\best.pt"
-DEFAULT_INPUT  = r"E:\work\model25789\datasets\UAV_tracking_video\tracking_test.mp4"
+DEFAULT_INPUT  = r"E:\work\model25789\datasets\UAV_tracking_video\tracking_2.mp4"
 # 固定输出目录与文件名
-DEFAULT_OUTPUT = r"E:\work\model25789\runs\out\output_result_tracking_test6.mp4"
+DEFAULT_OUTPUT = r"E:\work\model25789\runs\out\output_result_tracking_2.2.mp4"
 DEFAULT_CONF   = 0.8
 
 def _ensure_parent_dir(path_str: str):
