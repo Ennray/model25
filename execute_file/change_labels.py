@@ -16,13 +16,14 @@ for label_file in os.listdir(labels_dir):
 
     # 这里需要知道图片尺寸
     from PIL import Image
+
     img = Image.open(image_file)
     img_w, img_h = img.size
 
     new_lines = []
-    with open(os.path.join(labels_dir, label_file), "r") as f:
+    with open(os.path.join(labels_dir, label_file)) as f:
         for line in f.readlines():
-            parts = line.strip().split(',')
+            parts = line.strip().split(",")
             if len(parts) < 8:
                 continue
 
