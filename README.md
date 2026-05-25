@@ -1,4 +1,4 @@
-``` 
+```
 1.1 虚拟环境搭建
 #创建虚拟环境，python>3.8版本即可，这里我是用的是3.10
 conda create -n yolov8_cuda python=3.10 -y
@@ -17,12 +17,12 @@ datasets/
 └── VisDrone/
     ├── test/
     │   ├── images/
-    │   └── labels/ 
+    │   └── labels/
     ├── train/
-    │   └── images/     
+    │   └── images/
     └── val/
         ├── images/
-        └── labels/   
+        └── labels/
 
 1.4 关于数据集脚本
 数据集脚本的路径为datasets\UAV_yaml\VisDrone.yaml，VisDrone.yaml文件里包含test、train、val的路径设置以及分类
@@ -44,4 +44,4 @@ python test.py
 #如果不能使用yolo命令可以直接使用以下命令进行检测（可自行更改）
 python detect.py
 
-``` 
+```
