@@ -1,13 +1,11 @@
-import json
-from flask import Flask, request, jsonify
-from werkzeug.exceptions import BadRequest
 import numpy as np
 import offline_3d_detect as SizeRecognition
+from flask import Flask, jsonify, request
+from werkzeug.exceptions import BadRequest
 
-
-'''
+"""
 模型2.2.2.1单机视场内物体尺寸识别接口
-'''
+"""
 
 app = Flask(__name__)
 
@@ -18,6 +16,7 @@ app = Flask(__name__)
 # Flask>=2.3 可以这样写（任选其一，别同时写两套）:
 app.json.sort_keys = False
 app.json.ensure_ascii = False
+
 
 def to_jsonable(obj):
     if isinstance(obj, (np.integer,)):
@@ -35,7 +34,8 @@ def to_jsonable(obj):
         return [to_jsonable(v) for v in obj]
     return obj
 
-@app.route('/execute_main', methods=['GET'])
+
+@app.route("/execute_main", methods=["GET"])
 def execute_main():
     try:
         payload = request.get_json(silent=True) or {}
@@ -52,5 +52,6 @@ def execute_main():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     app.run(port=5000, debug=True)
